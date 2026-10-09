@@ -1,0 +1,3 @@
+{$STUDIO_DOMAIN} {
+  reverse_proxy studio:3333
+}

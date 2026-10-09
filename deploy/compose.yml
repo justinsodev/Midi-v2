@@ -1,0 +1,51 @@
+# Linux deployment. Host networking is required here for coturn's relay ports.
+services:
+  studio:
+    build: ..
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3333
+      TURN_URLS: ${TURN_URLS:?Set public TURN URL}
+      TURN_SECRET: ${TURN_SECRET:?Set a random shared secret}
+      ALLOWED_ORIGINS: https://${STUDIO_DOMAIN:?Set studio domain}
+    ports: ["127.0.0.1:3333:3333"]
+    restart: unless-stopped
+  https:
+    image: caddy:2
+    environment:
+      STUDIO_DOMAIN: ${STUDIO_DOMAIN:?Set studio domain}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+  turn:
+    image: coturn/coturn:latest
+    network_mode: host
+    command:
+      - -n
+      - --fingerprint
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SECRET:?Set a random shared secret}
+      - --realm=${TURN_DOMAIN:?Set TURN domain}
+      - --external-ip=${TURN_EXTERNAL_IP:?Set server public IPv4}
+      - --listening-port=3478
+      - --min-port=49160
+      - --max-port=49200
+      - --no-cli
+      - --no-tls
+      - --no-dtls
+      - --no-multicast-peers
+      - --denied-peer-ip=0.0.0.0-0.255.255.255
+      - --denied-peer-ip=10.0.0.0-10.255.255.255
+      - --denied-peer-ip=127.0.0.0-127.255.255.255
+      - --denied-peer-ip=169.254.0.0-169.254.255.255
+      - --denied-peer-ip=172.16.0.0-172.31.255.255
+      - --denied-peer-ip=192.168.0.0-192.168.255.255
+      - --denied-peer-ip=::1
+      - --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+    restart: unless-stopped
+volumes:
+  caddy_data:
+  caddy_config:
