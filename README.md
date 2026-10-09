@@ -31,7 +31,7 @@ Open http://localhost:3333. `npm start` loads an optional `.env`; use `.env.exam
 - Virtual keyboard and three lightweight synth patches; independent collaborator volume.
 - Local monitoring without waiting for the network. Remote events play immediately by default.
 - Two room-wide transport policies: **fast** unordered delivery with no transport retries plus a rolling 12-event history and three tail repeats at roughly 5 ms intervals; **reliable** unordered delivery for comparison.
-- Reliable control channel with 250 ms snapshots, clock exchanges, instrument selection and panic. State recovery fixes held notes/controllers; it cannot restore the correct timing of a missed transient.
+- Reliable control channel with 250 ms snapshots, clock exchanges, instrument selection and panic. Snapshots with missing performance events wait up to 100 ms for redundant packets before fencing older events; ordinary note delivery remains immediate. State recovery fixes held notes/controllers; it cannot restore the correct timing of a missed transient.
 - Voice instance IDs, deduplication, generation checks, controller ordering and panic fences prevent common stuck-note and stale-note failures.
 - Direct/relayed route reporting, RTT, estimated event-age p95/p99, queue size, duplicate/reordering counters, and JSON report download.
 - Deterministic receiver-side packet loss and a 100-note test sequence. This injection happens after WebRTC delivery and cannot model SCTP retransmissions; use network impairment tooling for that comparison.
@@ -46,7 +46,7 @@ The worklet mixes up to 96 synth voices into stereo PCM with short attack/releas
 
 Optional remote playout targets of 5/10/20 ms are measured from the source event after estimated clock mapping. Events that have already exceeded that target play immediately. This is a fixed scheduling experiment, not an adaptive jitter buffer or ensemble-wide synchronisation system. Snapshot application is immediate and can preempt buffered notes when deliberately testing long network delay.
 
-Note-ons older than 100 ms according to the estimated peer clock are skipped on the performance path. Current held-note state may still be repaired from a later snapshot. A missing final release is normally repaired within the 250 ms snapshot interval plus transport delay. A peer that becomes unresponsive is silenced after a roughly 3-second heartbeat timeout. Disconnect and leave silence that performer's voices. Rejoin manually after signalling or ICE failure.
+Note-ons older than 100 ms according to the estimated peer clock are skipped on the performance path. Current held-note state may still be repaired from a later snapshot. A missing final release is normally repaired within the 250 ms snapshot interval plus up to 100 ms recovery grace and transport delay. A peer that becomes unresponsive is silenced after a roughly 3-second heartbeat timeout. Disconnect and leave silence that performer's voices. Rejoin manually after signalling or ICE failure.
 
 ## What the measurements mean
 

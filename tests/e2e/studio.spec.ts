@@ -50,13 +50,19 @@ test('renders a held remote note and recovers its lost release', async ({ browse
     await expect(pages[2].getByTestId('peer-count')).toHaveText('1');
   } finally { for (const context of contexts) await context.close(); }
 });
-test('fast redundancy withstands reproducible five-percent receive loss', async ({ browser }) => {
+test('fast redundancy withstands reproducible five-percent receive loss', async ({ browser }, testInfo) => {
   const { contexts, pages } = await room(browser);
   try {
     await pages[1].getByLabel('Injected receive loss').selectOption('5');
     await pages[2].getByLabel('Injected receive loss').selectOption('5');
     await pages[0].getByRole('button', { name: 'Send 100-note test' }).click();
     for (const page of pages.slice(1)) { await expect(page.getByTestId('received-notes')).toHaveText('100', { timeout: 20000 }); await expect(page.getByTestId('active-voices')).toHaveText('0'); }
+  } catch (error) {
+    // Preserve counters to distinguish skipped late onsets from packet loss.
+    for (let index = 0; index < pages.length; index++) {
+      await testInfo.attach(`musician-${index}-diagnostics`, { body: await pages[index].locator('.diagnostics').innerText(), contentType: 'text/plain' }).catch(() => {});
+    }
+    throw error;
   } finally { for (const context of contexts) await context.close(); }
 });
 test('requires a name and explains unavailable forced TURN', async ({ page }) => {

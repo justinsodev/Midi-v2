@@ -1,4 +1,4 @@
-import { clockSample, encodeEvents, EventReceiver, MidiSource, percentile } from '../shared/protocol';
+import { clockSample, encodeEvents, EventReceiver, MidiSource, percentile, SnapshotRecovery } from '../shared/protocol';
 import type { Member, MidiEvent, PerformanceState, RoomOptions } from '../shared/protocol';
 import { StudioAudio } from './audio';
 export interface PeerView extends Member {
@@ -11,6 +11,7 @@ interface Peer {
   receiver: EventReceiver; pending: RTCIceCandidateInit[]; descriptionSet: boolean; view: PeerView;
   samples: { rtt: number; offset: number }[]; offset: number; ages: number[]; serial: Promise<void>;
   lastControl: number; pings: Set<number>; heartbeatLost: boolean;
+  recovery: SnapshotRecovery; snapshotTimer?: ReturnType<typeof setTimeout>;
 }
 export class StudioRoom {
   readonly source = new MidiSource(); readonly epoch = crypto.getRandomValues(new Uint32Array(1))[0];
@@ -55,8 +56,9 @@ export class StudioRoom {
   private createPeer(member: Member) {
     if (this.disposed || this.peers.has(member.id)) return;
     const pc = new RTCPeerConnection({ iceServers: this.ice, iceTransportPolicy: this.options.forceRelay ? 'relay' : 'all' });
+    const receiver = new EventReceiver();
     const peer: Peer = {
-      member, pc, receiver: new EventReceiver(), pending: [], descriptionSet: false,
+      member, pc, receiver, recovery: new SnapshotRecovery(receiver), pending: [], descriptionSet: false,
       view: { ...member, status: 'connecting', clockReady: false, rtt: 0, jitter: 0, ageP95: 0, ageP99: 0, noteOns: 0, events: 0, duplicates: 0, recovered: 0, late: 0, buffered: 0, route: 'checking', patch: 'triangle', snapshots: 0 },
       samples: [], offset: 0, ages: [], serial: Promise.resolve(), lastControl: performance.now(), pings: new Set(), heartbeatLost: false,
     };
@@ -107,6 +109,7 @@ export class StudioRoom {
             live.push({ ...event, time: localTime });
           }
           if (live.length) this.audio.events(peer.member.id, live, this.bufferMs);
+          this.applySnapshot(peer, peer.recovery.flush(now));
           peer.view.duplicates = peer.receiver.duplicates; peer.view.recovered = peer.receiver.recovered;
         } catch (error) { this.fail(error); }
       };
@@ -124,7 +127,7 @@ export class StudioRoom {
             const best = [...peer.samples].sort((a, b) => a.rtt - b.rtt).slice(0, 5);
             peer.offset = best.reduce((sum, item) => sum + item.offset, 0) / best.length;
             peer.view.rtt = sample.rtt; peer.view.clockReady = true;
-          } else if (message.type === 'snapshot' && this.validState(message.state) && peer.receiver.reconcile(message.state.seq)) { this.audio.snapshot(peer.member.id, message.state); peer.view.snapshots++; }
+          } else if (message.type === 'snapshot' && this.validState(message.state)) { this.applySnapshot(peer, peer.recovery.offer(message.state, now)); }
           else if (message.type === 'patch' && ['triangle', 'sine', 'warm'].includes(message.patch)) { peer.view.patch = message.patch; this.audio.patch(peer.member.id, message.patch); }
           else if (message.type === 'panic') this.audio.panic(peer.member.id);
         } catch (error) { this.fail(error); }
@@ -136,6 +139,14 @@ export class StudioRoom {
     };
     channel.onclose = () => { peer.view.status = 'disconnected'; this.audio.panic(peer.member.id); this.changed(); };
     channel.onerror = () => { peer.view.status = 'channel error'; this.audio.panic(peer.member.id); this.changed(); };
+  }
+  private applySnapshot(peer: Peer, state: PerformanceState | null) {
+    if (peer.snapshotTimer) { clearTimeout(peer.snapshotTimer); peer.snapshotTimer = undefined; }
+    if (state) { this.audio.snapshot(peer.member.id, state); peer.view.snapshots++; }
+    const deadline = peer.recovery.deadline;
+    if (deadline !== undefined) peer.snapshotTimer = setTimeout(() => {
+      if (!this.disposed && this.peers.get(peer.member.id) === peer) this.applySnapshot(peer, peer.recovery.flush(performance.now()));
+    }, Math.max(0, deadline - performance.now()));
   }
   private validState(value: unknown): value is PerformanceState {
     if (!value || typeof value !== 'object') return false;
@@ -194,6 +205,6 @@ export class StudioRoom {
       if (!this.disposed) this.changed();
     } finally { this.ticking = false; }
   }
-  private remove(id: string) { const peer = this.peers.get(id); if (!peer) return; this.peers.delete(id); this.audio.panic(id); peer.pc.close(); this.changed(); }
+  private remove(id: string) { const peer = this.peers.get(id); if (!peer) return; if (peer.snapshotTimer) clearTimeout(peer.snapshotTimer); this.peers.delete(id); this.audio.panic(id); peer.pc.close(); this.changed(); }
   leave() { this.disposed = true; if (this.interval) clearInterval(this.interval); if (this.resend) clearTimeout(this.resend); this.audio.panic(); for (const id of [...this.peers.keys()]) this.remove(id); this.socket?.close(); }
 }

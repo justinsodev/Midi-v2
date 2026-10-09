@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { clockSample, decodeEvents, encodeEvents, EventReceiver, MidiSource, percentile } from '../shared/protocol';
+import { clockSample, decodeEvents, encodeEvents, EventReceiver, MidiSource, percentile, SnapshotRecovery } from '../shared/protocol';
 const event = (seq: number, status = 0x90, voice = seq) => ({ seq, time: seq * 2, status, voice, a: 60, b: status === 0x90 ? 100 : 0 });
 describe('binary protocol', () => {
   it('preserves timestamps, MIDI bytes, voice IDs and generation', () => {
@@ -69,6 +69,61 @@ describe('performance recovery', () => {
     source.event([0xb0, 64, 127], 0); source.event([0xb0, 120, 0], 1);
     expect(source.snapshot().voices).toHaveLength(1); expect(source.snapshot().voices[0].channel).toBe(1);
     expect(source.snapshot().sustain[0]).toBe(0); expect(source.event([0xf8], 2)).toBeNull();
+  });
+});
+describe('snapshot ordering across channels', () => {
+  const state = (seq: number) => ({ seq, voices: [], sustain: Array(16).fill(0), pitch: Array(16).fill(8192) });
+  it('lets a redundant note packet catch up when a snapshot arrives first', () => {
+    const receiver = new EventReceiver(); const recovery = new SnapshotRecovery(receiver);
+    expect(recovery.offer(state(2), 0)).toBeNull();
+    expect(receiver.accept(encodeEvents(1, [event(1), event(2, 0x80, 1)]))).toHaveLength(2);
+    expect(recovery.flush(5)).toEqual(state(2));
+    expect(receiver.accept(encodeEvents(1, [event(1)]))).toEqual([]);
+  });
+  it('waits for gaps below the highest received sequence too', () => {
+    const receiver = new EventReceiver(); const recovery = new SnapshotRecovery(receiver);
+    receiver.accept(encodeEvents(1, [event(2)]));
+    expect(recovery.offer(state(2), 0)).toBeNull();
+    expect(receiver.accept(encodeEvents(1, [event(1)]))).toHaveLength(1);
+    expect(recovery.flush(5)).toEqual(state(2));
+  });
+  it('repairs a fully lost release after a bounded wait and fences stale notes', () => {
+    const receiver = new EventReceiver(); const recovery = new SnapshotRecovery(receiver);
+    receiver.accept(encodeEvents(1, [event(1)]));
+    expect(recovery.offer(state(2), 0)).toBeNull();
+    expect(recovery.flush(99)).toBeNull(); expect(recovery.flush(100)).toEqual(state(2));
+    expect(receiver.accept(encodeEvents(1, [event(2, 0x80, 1)]))).toEqual([]);
+    expect(recovery.offer(state(2), 101)).toEqual(state(2));
+  });
+  it('does not extend recovery indefinitely when newer snapshots arrive', () => {
+    const receiver = new EventReceiver(); const recovery = new SnapshotRecovery(receiver);
+    recovery.offer(state(2), 0); recovery.offer(state(3), 50);
+    expect(recovery.deadline).toBe(100); expect(recovery.flush(100)).toEqual(state(3));
+  });
+  it('rejects pending state after newer performance events arrive', () => {
+    const receiver = new EventReceiver(); const recovery = new SnapshotRecovery(receiver);
+    recovery.offer(state(1), 0); receiver.accept(encodeEvents(1, [event(1), event(2)]));
+    expect(recovery.flush(5)).toBeNull(); expect(recovery.deadline).toBeUndefined();
+    expect(recovery.offer(state(1), 6)).toBeNull();
+  });
+  it('preserves 100 onsets under seeded loss and snapshots overtaking packets', () => {
+    const receiver = new EventReceiver(); const recovery = new SnapshotRecovery(receiver);
+    const source = new MidiSource(); const history: ReturnType<MidiSource['event']>[] = [];
+    let random = 0x12345678; let notes = 0; let dropped = 0;
+    const deliver = () => {
+      random ^= random << 13; random ^= random >>> 17; random ^= random << 5;
+      if ((random >>> 0) / 0x100000000 < .05) { dropped++; return; }
+      notes += receiver.accept(encodeEvents(1, history.filter(item => item !== null))).filter(item => (item.status & 0xf0) === 0x90 && item.b > 0).length;
+    };
+    for (let index = 0; index < 100; index++) {
+      for (const status of [0x90, 0x80]) {
+        const now = source.seq * 30; history.push(source.event([status, 60, status === 0x90 ? 100 : 0], now));
+        if (history.length > 12) history.shift();
+        recovery.offer(source.snapshot(), now); // Deliberately make control win every race.
+        for (let repeat = 0; repeat < 4; repeat++) { deliver(); recovery.flush(now + repeat * 5); }
+      }
+    }
+    expect(dropped).toBeGreaterThan(0); expect(notes).toBe(100);
   });
 });
 describe('diagnostics', () => {

@@ -74,6 +74,7 @@ export class EventReceiver {
   private controllers = new Map<string, number>();
   private channelFence = new Map<number, number>();
   private floor = 0;
+  private contiguous = 0;
   high = 0; duplicates = 0; recovered = 0; reordered = 0;
   accept(buffer: ArrayBuffer): MidiEvent[] {
     const packet = decodeEvents(buffer);
@@ -83,6 +84,7 @@ export class EventReceiver {
     for (const event of packet.events.sort((a, b) => a.seq - b.seq)) {
       if (event.seq <= this.floor || this.seen.has(event.seq)) { this.duplicates++; continue; }
       this.seen.add(event.seq);
+      while (this.seen.has(this.contiguous + 1)) this.contiguous++;
       if (event.seq < this.high) { this.reordered++; this.recovered++; }
       this.high = Math.max(this.high, event.seq);
       const kind = event.status & 0xf0;
@@ -101,6 +103,7 @@ export class EventReceiver {
     // Bound memory without discarding ordinary out-of-order events.
     if (this.seen.size > 8192) {
       this.floor = Math.max(this.floor, this.high - 4096);
+      this.contiguous = Math.max(this.contiguous, this.floor);
       for (const seq of this.seen) if (seq <= this.floor) this.seen.delete(seq);
     }
     if (this.ended.size > 8192) this.ended.delete(this.ended.values().next().value!);
@@ -108,7 +111,29 @@ export class EventReceiver {
   }
   reconcile(seq: number): boolean {
     if (!Number.isInteger(seq) || seq < this.high || seq < this.floor) return false;
-    this.floor = seq; this.high = seq; this.seen.clear(); return true;
+    this.floor = seq; this.high = seq; this.contiguous = seq; this.seen.clear(); return true;
+  }
+  completeThrough(seq: number): boolean { return seq <= this.contiguous; }
+}
+
+// The reliable control channel can overtake performance packets. Give missing
+// events a bounded chance to arrive before an authoritative snapshot fences them.
+export class SnapshotRecovery {
+  private pending?: { state: PerformanceState; deadline: number };
+  constructor(private receiver: EventReceiver, private graceMs = 100) {}
+  get deadline(): number | undefined { return this.pending?.deadline; }
+  offer(state: PerformanceState, now: number): PerformanceState | null {
+    if (state.seq < this.receiver.high || (this.pending && state.seq < this.pending.state.seq)) return null;
+    this.pending = { state, deadline: this.pending?.deadline ?? now + this.graceMs };
+    return this.flush(now);
+  }
+  flush(now: number): PerformanceState | null {
+    if (!this.pending) return null;
+    const { state, deadline } = this.pending;
+    if (state.seq < this.receiver.high) { this.pending = undefined; return null; }
+    if (!this.receiver.completeThrough(state.seq) && now < deadline) return null;
+    this.pending = undefined;
+    return this.receiver.reconcile(state.seq) ? state : null;
   }
 }
 
